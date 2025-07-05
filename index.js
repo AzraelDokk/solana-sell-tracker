@@ -1,53 +1,76 @@
-const express = require("express");
-const fs = require("fs");
-const fetch = require("node-fetch");
-
-const TELEGRAM_BOT_TOKEN = "7613223933:AAFXYWU3qfqcTFgpd3lgfXMFgJAdWRIevNo";
-const TELEGRAM_CHAT_ID = "5473473053"; // Your Telegram user ID from getUpdates
-const WALLET_TO_TRACK = "8psNvWTrdNTiVRNzAgsou9kETXNJm2SXZyaKuJraVRtf";
-
-const LOG_FILE = "notified.json";
-let hasNotified = fs.existsSync(LOG_FILE) ? JSON.parse(fs.readFileSync(LOG_FILE)) : false;
+const express = require('express');
+const axios = require('axios');
+const fs = require('fs');
 
 const app = express();
+const port = process.env.PORT || 10000;
+
 app.use(express.json());
 
-async function sendTelegram(message) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message }),
-  });
+const WALLET_TO_TRACK = process.env.WALLET_TO_TRACK;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+const NOTIFIED_FILE = './notified.json';
+
+let notified = false;
+if (fs.existsSync(NOTIFIED_FILE)) {
+  try {
+    const data = fs.readFileSync(NOTIFIED_FILE, 'utf8');
+    const parsed = JSON.parse(data);
+    notified = parsed.notified;
+  } catch (err) {
+    console.error('Error reading notified.json:', err);
+  }
 }
 
-app.post("/webhook", async (req, res) => {
-  if (hasNotified) return res.sendStatus(200);
+function saveNotifiedStatus(status) {
+  fs.writeFileSync(NOTIFIED_FILE, JSON.stringify({ notified: status }));
+}
 
-  const events = req.body.events || [];
+app.post('/webhook', async (req, res) => {
+  console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
 
-  for (const event of events) {
-    // Check if the wallet sold any token by swap or token transfer out
-    const isSwap = event.type === "SWAP" && event.source === WALLET_TO_TRACK;
-    const isTransferOut = event.tokenTransfers?.some(
-      (t) => t.fromUser === WALLET_TO_TRACK
-    );
+  try {
+    const events = req.body.events || [];
 
-    if (isSwap || isTransferOut) {
-      const tx = event.signature || "unknown";
-      const msg = `🚨 Wallet ${WALLET_TO_TRACK} just SOLD a token.\n🔗 https://solscan.io/tx/${tx}`;
+    for (const event of events) {
+      if (event.type === 'SWAP' && event.description.includes('Sold') && event.nativeAccount === WALLET_TO_TRACK) {
+        console.log('🔍 Matched swap event for tracked wallet.');
 
-      await sendTelegram(msg);
-      hasNotified = true;
-      fs.writeFileSync(LOG_FILE, JSON.stringify(true));
-      break;
+        if (!notified) {
+          const tokenInfo = event.description || 'Sold token';
+
+          const message = `🚨 First sell detected for wallet:\n${WALLET_TO_TRACK}\n\n${tokenInfo}`;
+          const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+          await axios.post(url, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: message,
+          });
+
+          console.log('✅ Telegram alert sent.');
+          notified = true;
+          saveNotifiedStatus(true);
+        } else {
+          console.log('ℹ️ Already notified, skipping Telegram alert.');
+        }
+      }
     }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('❌ Error processing webhook:', err);
+    res.sendStatus(500);
   }
-
-  res.sendStatus(200);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Listening on port ${PORT}`);
+// Optional root handler so Render shows something on /
+app.get('/', (req, res) => {
+  res.send('✅ Server is running.');
 });
+
+app.listen(port, () => {
+  console.log(`✅ Listening on port ${port}`);
+});
+

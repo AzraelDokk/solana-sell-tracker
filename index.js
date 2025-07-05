@@ -1,76 +1,41 @@
 const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
 
 const app = express();
-const port = process.env.PORT || 10000;
-
 app.use(express.json());
 
-const WALLET_TO_TRACK = process.env.WALLET_TO_TRACK;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;  // e.g. "7613...:AAFX..."
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;      // your chat ID like "5473473053"
 
-const NOTIFIED_FILE = './notified.json';
-
-let notified = false;
-if (fs.existsSync(NOTIFIED_FILE)) {
-  try {
-    const data = fs.readFileSync(NOTIFIED_FILE, 'utf8');
-    const parsed = JSON.parse(data);
-    notified = parsed.notified;
-  } catch (err) {
-    console.error('Error reading notified.json:', err);
-  }
-}
-
-function saveNotifiedStatus(status) {
-  fs.writeFileSync(NOTIFIED_FILE, JSON.stringify({ notified: status }));
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+  console.error('ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in environment variables!');
+  process.exit(1);
 }
 
 app.post('/webhook', async (req, res) => {
-  console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
-
   try {
-    const events = req.body.events || [];
+    console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
 
-    for (const event of events) {
-      if (event.type === 'SWAP' && event.description.includes('Sold') && event.nativeAccount === WALLET_TO_TRACK) {
-        console.log('🔍 Matched swap event for tracked wallet.');
+    // Build the message to send to Telegram
+    const message = `🚨 New webhook data received:\n\`\`\`\n${JSON.stringify(req.body, null, 2)}\n\`\`\``;
 
-        if (!notified) {
-          const tokenInfo = event.description || 'Sold token';
+    // Send message to Telegram bot
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: 'Markdown'
+    });
 
-          const message = `🚨 First sell detected for wallet:\n${WALLET_TO_TRACK}\n\n${tokenInfo}`;
-          const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
-          await axios.post(url, {
-            chat_id: TELEGRAM_CHAT_ID,
-            text: message,
-          });
-
-          console.log('✅ Telegram alert sent.');
-          notified = true;
-          saveNotifiedStatus(true);
-        } else {
-          console.log('ℹ️ Already notified, skipping Telegram alert.');
-        }
-      }
-    }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('❌ Error processing webhook:', err);
-    res.sendStatus(500);
+    res.status(200).send('ok');
+  } catch (error) {
+    console.error('Webhook handler error:', error);
+    res.status(500).send('Internal Server Error');
   }
 });
 
-// Optional root handler so Render shows something on /
-app.get('/', (req, res) => {
-  res.send('✅ Server is running.');
-});
-
-app.listen(port, () => {
-  console.log(`✅ Listening on port ${port}`);
+// Render sets PORT environment variable automatically
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`✅ Listening on port ${PORT}`);
 });
 

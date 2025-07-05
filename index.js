@@ -7,64 +7,57 @@ app.use(express.json());
 
 const ALERT_FILE = './alertSent.json';
 
-function wasAlertSent() {
+// Load alert state (token-specific)
+function getSentAlerts() {
   try {
     const data = fs.readFileSync(ALERT_FILE, 'utf8');
-    const obj = JSON.parse(data);
-    return obj.alertSent === true;
+    return JSON.parse(data);
   } catch {
-    return false;
+    return {};
   }
 }
 
-function markAlertSent() {
-  fs.writeFileSync(ALERT_FILE, JSON.stringify({ alertSent: true }));
+// Save updated alert state
+function markAlertSentForToken(mint) {
+  const alerts = getSentAlerts();
+  alerts[mint] = true;
+  fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
 }
 
 app.post('/webhook', async (req, res) => {
   console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
 
-  if (wasAlertSent()) {
-    console.log('⚠️ Alert already sent. Ignoring this event.');
-    return res.sendStatus(200);
-  }
-
   try {
     const events = req.body;
     if (!Array.isArray(events)) return res.sendStatus(400);
+
+    const sentAlerts = getSentAlerts();
 
     for (const event of events) {
       const accountData = event.accountData || [];
       for (const account of accountData) {
         const tokenChanges = account.tokenBalanceChanges || [];
         for (const tokenChange of tokenChanges) {
-          if (parseInt(tokenChange.rawTokenAmount.tokenAmount) < 0) {
-            const mintAddress = tokenChange.mint;
-            let tokenSymbol = mintAddress;
+          const mint = tokenChange.mint;
+          const amount = parseInt(tokenChange.rawTokenAmount.tokenAmount);
 
-            try {
-              const metadataResponse = await axios.get(
-                `https://api.helius.xyz/v0/tokens/metadata?mint=${mintAddress}&api-key=${process.env.HELIUS_API_KEY}`
-              );
-              if (metadataResponse.data && metadataResponse.data.symbol) {
-                tokenSymbol = metadataResponse.data.symbol;
-              }
-            } catch (err) {
-              console.warn('⚠️ Could not fetch token symbol, using mint address.');
-            }
+          if (amount >= 0 || sentAlerts[mint]) continue;
 
-            const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${mintAddress}`;
+          const tokenSymbol = mint;
+          const contractAddress = mint;
 
-            await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
-              chat_id: process.env.TG_CHAT_ID,
-              text: message,
-              parse_mode: 'Markdown',
-            });
+          const message = `🚨 First Token Sell Detected!
+Token Symbol: ${tokenSymbol}
+Contract Address: ${contractAddress}`;
 
-            console.log('✅ Telegram alert sent!');
-            markAlertSent();
-            return res.sendStatus(200);
-          }
+          await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
+            chat_id: process.env.TG_CHAT_ID,
+            text: message,
+            parse_mode: 'Markdown',
+          });
+
+          console.log(`✅ Alert sent for ${mint}`);
+          markAlertSentForToken(mint);
         }
       }
     }

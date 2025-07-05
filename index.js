@@ -7,26 +7,27 @@ app.use(express.json());
 
 const ALERT_FILE = './alertSent.json';
 
-// Load alerted tokens list from file
-function loadAlertedTokens() {
+function wasAlertSent() {
   try {
     const data = fs.readFileSync(ALERT_FILE, 'utf8');
     const obj = JSON.parse(data);
-    return obj.alertedTokens || [];
+    return obj.alertSent === true;
   } catch {
-    return [];
+    return false;
   }
 }
 
-// Save alerted tokens list to file
-function saveAlertedTokens(tokens) {
-  fs.writeFileSync(ALERT_FILE, JSON.stringify({ alertedTokens: tokens }));
+function markAlertSent() {
+  fs.writeFileSync(ALERT_FILE, JSON.stringify({ alertSent: true }));
 }
 
 app.post('/webhook', async (req, res) => {
   console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
 
-  const alertedTokens = loadAlertedTokens();
+  if (wasAlertSent()) {
+    console.log('⚠️ Alert already sent. Ignoring this event.');
+    return res.sendStatus(200);
+  }
 
   try {
     const events = req.body;
@@ -38,15 +39,21 @@ app.post('/webhook', async (req, res) => {
         const tokenChanges = account.tokenBalanceChanges || [];
         for (const tokenChange of tokenChanges) {
           if (parseInt(tokenChange.rawTokenAmount.tokenAmount) < 0) {
-            const tokenMint = tokenChange.mint;
+            const mintAddress = tokenChange.mint;
+            let tokenSymbol = mintAddress;
 
-            if (alertedTokens.includes(tokenMint)) {
-              console.log(`⚠️ Alert already sent for token ${tokenMint}. Ignoring.`);
-              continue;
+            try {
+              const metadataResponse = await axios.get(
+                `https://api.helius.xyz/v0/tokens/metadata?mint=${mintAddress}&api-key=${process.env.HELIUS_API_KEY}`
+              );
+              if (metadataResponse.data && metadataResponse.data.symbol) {
+                tokenSymbol = metadataResponse.data.symbol;
+              }
+            } catch (err) {
+              console.warn('⚠️ Could not fetch token symbol, using mint address.');
             }
 
-            // Compose Telegram message (Token Symbol and Contract Address)
-            const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenMint}\nContract Address: ${tokenMint}`;
+            const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${mintAddress}`;
 
             await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
               chat_id: process.env.TG_CHAT_ID,
@@ -55,17 +62,13 @@ app.post('/webhook', async (req, res) => {
             });
 
             console.log('✅ Telegram alert sent!');
-
-            alertedTokens.push(tokenMint);
-            saveAlertedTokens(alertedTokens);
-
+            markAlertSent();
             return res.sendStatus(200);
           }
         }
       }
     }
 
-    // No sells detected in this webhook payload
     res.sendStatus(200);
   } catch (error) {
     console.error('Webhook handler error:', error);

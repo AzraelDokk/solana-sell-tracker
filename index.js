@@ -7,22 +7,23 @@ app.use(express.json());
 
 const ALERT_FILE = './alertSent.json';
 
-// Load alert state (token-specific)
-function getSentAlerts() {
+function loadAlertedTokens() {
   try {
-    const data = fs.readFileSync(ALERT_FILE, 'utf8');
-    return JSON.parse(data);
+    return JSON.parse(fs.readFileSync(ALERT_FILE, 'utf8'));
   } catch {
     return {};
   }
 }
 
-// Save updated alert state
-function markAlertSentForToken(mint) {
-  const alerts = getSentAlerts();
-  alerts[mint] = true;
-  fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
+function saveAlertedTokens(data) {
+  fs.writeFileSync(ALERT_FILE, JSON.stringify(data));
 }
+
+// Common system tokens to ignore
+const ignoredMints = [
+  "So11111111111111111111111111111111111111112", // SOL
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  // USDC
+];
 
 app.post('/webhook', async (req, res) => {
   console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
@@ -31,24 +32,31 @@ app.post('/webhook', async (req, res) => {
     const events = req.body;
     if (!Array.isArray(events)) return res.sendStatus(400);
 
-    const sentAlerts = getSentAlerts();
+    const alerted = loadAlertedTokens();
 
     for (const event of events) {
       const accountData = event.accountData || [];
+
       for (const account of accountData) {
         const tokenChanges = account.tokenBalanceChanges || [];
+
         for (const tokenChange of tokenChanges) {
           const mint = tokenChange.mint;
-          const amount = parseInt(tokenChange.rawTokenAmount.tokenAmount);
 
-          if (amount >= 0 || sentAlerts[mint]) continue;
+          // Skip if SOL/USDC or not a negative transfer
+          if (
+            ignoredMints.includes(mint) ||
+            parseFloat(tokenChange.rawTokenAmount.tokenAmount) >= 0
+          ) continue;
 
-          const tokenSymbol = mint;
-          const contractAddress = mint;
+          // Skip if we've already alerted for this token
+          if (alerted[mint]) {
+            console.log(`⚠️ Already alerted for ${mint}`);
+            continue;
+          }
 
-          const message = `🚨 First Token Sell Detected!
-Token Symbol: ${tokenSymbol}
-Contract Address: ${contractAddress}`;
+          // Send Telegram alert
+          const message = `🚨 First Token Sell Detected!\nToken Symbol: ${mint}\nContract Address: ${mint}`;
 
           await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
             chat_id: process.env.TG_CHAT_ID,
@@ -56,8 +64,12 @@ Contract Address: ${contractAddress}`;
             parse_mode: 'Markdown',
           });
 
-          console.log(`✅ Alert sent for ${mint}`);
-          markAlertSentForToken(mint);
+          console.log('✅ Telegram alert sent for:', mint);
+
+          alerted[mint] = true;
+          saveAlertedTokens(alerted);
+
+          return res.sendStatus(200);
         }
       }
     }

@@ -6,10 +6,7 @@ const app = express();
 app.use(express.json());
 
 const ALERT_FILE = './alertSent.json';
-
-// Replace this with your wallet address exactly
 const WALLET_ADDRESS = 'G4UqKTzrao2mV1WAah8F7QRS8GYHGMgyaRb27ZZFxki1';
-
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TG_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TG_CHAT_ID;
@@ -34,23 +31,32 @@ function savePreviouslySold() {
   fs.writeFileSync(ALERT_FILE, JSON.stringify({ tokens: Array.from(alreadySold) }));
 }
 
-// Fetch past token sells from Helius API (SWAP type only)
+// Fetch all past token sells with pagination
 async function fetchPastSoldTokens() {
   try {
-    const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&type=SWAP`;
-    const { data } = await axios.get(url);
-    const tokenMints = new Set();
+    let page = 1;
+    let allTokenMints = new Set();
 
-    data.forEach((tx) => {
-      if (!Array.isArray(tx.tokenTransfers)) return;
-      tx.tokenTransfers.forEach((t) => {
-        if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
-          tokenMints.add(t.mint);
-        }
+    while (true) {
+      const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&type=SWAP&page=${page}`;
+      const { data } = await axios.get(url);
+
+      if (!data || data.length === 0) break;
+
+      data.forEach((tx) => {
+        if (!Array.isArray(tx.tokenTransfers)) return;
+        tx.tokenTransfers.forEach((t) => {
+          // Check if token was sent from your wallet and tokenAmount > 0 (sell)
+          if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
+            allTokenMints.add(t.mint);
+          }
+        });
       });
-    });
 
-    alreadySold = new Set([...alreadySold, ...tokenMints]);
+      page++;
+    }
+
+    alreadySold = new Set([...alreadySold, ...allTokenMints]);
     savePreviouslySold();
     console.log(`📦 Fetched and stored past sells. Total = ${alreadySold.size}`);
   } catch (e) {
@@ -58,8 +64,10 @@ async function fetchPastSoldTokens() {
   }
 }
 
-// Webhook endpoint to handle incoming Helius events
+// Handle incoming Helius webhook
 app.post('/webhook', async (req, res) => {
+  console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
+
   const events = req.body;
   if (!Array.isArray(events)) return res.sendStatus(400);
 
@@ -72,13 +80,13 @@ app.post('/webhook', async (req, res) => {
       for (const change of changes) {
         const { userAccount, rawTokenAmount, mint } = change;
 
-        // Check: only alert on first sell (negative tokenAmount) for this token mint
+        // Negative tokenAmount = sell, and check if not alerted before
         if (
           userAccount === WALLET_ADDRESS &&
           parseFloat(rawTokenAmount.tokenAmount) < 0 &&
           !alreadySold.has(mint)
         ) {
-          const tokenSymbol = mint; // Optional: you can fetch real symbol via token metadata API later
+          const tokenSymbol = mint; // You can replace with mapping if you want symbols
           const contractAddress = mint;
 
           const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${contractAddress}`;
@@ -103,6 +111,7 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
+  console.log('ℹ️ No new sells detected.');
   res.sendStatus(200);
 });
 

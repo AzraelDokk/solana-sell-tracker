@@ -1,73 +1,59 @@
 const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
+const { MongoClient } = require('mongodb');
 const app = express();
-
 app.use(express.json());
 
-const ALERT_FILE = './alertSent.json';
-const WALLET_ADDRESS = 'G4UqKTzrao2mV1WAah8F7QRS8GYHGMgyaRb27ZZFxki1';
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+// ENVIRONMENT VARIABLES
 const TELEGRAM_BOT_TOKEN = process.env.TG_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TG_CHAT_ID;
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const MONGODB_URI = process.env.MONGODB_URI;
+const WALLET_ADDRESS = 'G4UqKTzrao2mV1WAah8F7QRS8GYHGMgyaRb27ZZFxki1';
 
-let alreadySold = new Set();
-
-// Load previously sold tokens from file
-function loadPreviouslySold() {
-  try {
-    const data = fs.readFileSync(ALERT_FILE, 'utf8');
-    const parsed = JSON.parse(data);
-    if (Array.isArray(parsed.tokens)) {
-      alreadySold = new Set(parsed.tokens);
-    }
-  } catch {
-    alreadySold = new Set();
-  }
+// MongoDB setup
+let db, soldCollection;
+async function connectToMongo() {
+  const client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db('solanaTracker');
+  soldCollection = db.collection('soldTokens');
+  console.log('✅ Connected to MongoDB Atlas');
 }
 
-// Save updated sold tokens
-function savePreviouslySold() {
-  fs.writeFileSync(ALERT_FILE, JSON.stringify({ tokens: Array.from(alreadySold) }));
-}
-
-// Fetch all past token sells with pagination
+// Fetch past sold token mints from Helius and save to DB
 async function fetchPastSoldTokens() {
   try {
-    let page = 1;
-    let allTokenMints = new Set();
+    const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&type=SWAP`;
+    const { data } = await axios.get(url);
+    let newMints = [];
 
-    while (true) {
-      const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&type=SWAP&page=${page}`;
-      const { data } = await axios.get(url);
+    for (const tx of data) {
+      if (!Array.isArray(tx.tokenTransfers)) continue;
 
-      if (!data || data.length === 0) break;
-
-      data.forEach((tx) => {
-        if (!Array.isArray(tx.tokenTransfers)) return;
-        tx.tokenTransfers.forEach((t) => {
-          // Check if token was sent from your wallet and tokenAmount > 0 (sell)
-          if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
-            allTokenMints.add(t.mint);
+      for (const t of tx.tokenTransfers) {
+        if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
+          const already = await soldCollection.findOne({ mint: t.mint });
+          if (!already) {
+            newMints.push({ mint: t.mint });
           }
-        });
-      });
-
-      page++;
+        }
+      }
     }
 
-    alreadySold = new Set([...alreadySold, ...allTokenMints]);
-    savePreviouslySold();
-    console.log(`📦 Fetched and stored past sells. Total = ${alreadySold.size}`);
-  } catch (e) {
-    console.error('❌ Failed to fetch past tokens:', e.message);
+    if (newMints.length > 0) {
+      await soldCollection.insertMany(newMints);
+    }
+
+    console.log(`📦 Fetched and stored past sells. Total new = ${newMints.length}`);
+  } catch (err) {
+    console.error('❌ Failed to fetch past tokens:', err.message);
   }
 }
 
-// Handle incoming Helius webhook
+// Webhook handler
 app.post('/webhook', async (req, res) => {
-  console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
-
+  console.log('✅ Webhook received');
   const events = req.body;
   if (!Array.isArray(events)) return res.sendStatus(400);
 
@@ -80,32 +66,30 @@ app.post('/webhook', async (req, res) => {
       for (const change of changes) {
         const { userAccount, rawTokenAmount, mint } = change;
 
-        // Negative tokenAmount = sell, and check if not alerted before
         if (
           userAccount === WALLET_ADDRESS &&
-          parseFloat(rawTokenAmount.tokenAmount) < 0 &&
-          !alreadySold.has(mint)
+          parseFloat(rawTokenAmount.tokenAmount) < 0
         ) {
-          const tokenSymbol = mint; // You can replace with mapping if you want symbols
-          const contractAddress = mint;
+          const already = await soldCollection.findOne({ mint });
 
-          const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${contractAddress}`;
+          if (!already) {
+            const message = `🚨 First Token Sell Detected!\nToken Symbol: ${mint}\nContract Address: ${mint}`;
 
-          try {
-            await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-              chat_id: TELEGRAM_CHAT_ID,
-              text: message,
-              parse_mode: 'Markdown'
-            });
+            try {
+              await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+                chat_id: TELEGRAM_CHAT_ID,
+                text: message,
+                parse_mode: 'Markdown',
+              });
 
-            console.log('✅ Telegram alert sent!');
-            alreadySold.add(mint);
-            savePreviouslySold();
-          } catch (e) {
-            console.error('❌ Error sending Telegram message:', e.response?.data || e.message);
+              console.log('✅ Telegram alert sent!');
+              await soldCollection.insertOne({ mint });
+            } catch (e) {
+              console.error('❌ Telegram error:', e.response?.data || e.message);
+            }
+
+            return res.sendStatus(200);
           }
-
-          return res.sendStatus(200);
         }
       }
     }
@@ -115,11 +99,9 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// Start server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
-  loadPreviouslySold();
-  console.log(`📦 Loaded ${alreadySold.size} previously sold token mints from history.`);
+  await connectToMongo();
   await fetchPastSoldTokens();
   console.log(`✅ Listening on port ${PORT}`);
 });

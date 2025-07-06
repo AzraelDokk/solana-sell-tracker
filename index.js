@@ -2,102 +2,105 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const app = express();
-
 app.use(express.json());
 
-const ALERT_FILE = './alertSent.json';
+const SOLD_TOKENS_FILE = './soldTokens.json';
 
-// Load alert state object mapping mint addresses to boolean
-function loadAlertState() {
+// Load previously sold tokens
+function loadSoldTokens() {
   try {
-    const data = fs.readFileSync(ALERT_FILE, 'utf8');
-    return JSON.parse(data);
+    return JSON.parse(fs.readFileSync(SOLD_TOKENS_FILE, 'utf8'));
   } catch {
-    return {};
+    return [];
   }
 }
 
-// Save alert state object
-function saveAlertState(state) {
-  fs.writeFileSync(ALERT_FILE, JSON.stringify(state));
+// Save updated list of sold tokens
+function saveSoldTokens(tokens) {
+  fs.writeFileSync(SOLD_TOKENS_FILE, JSON.stringify(tokens));
+}
+
+// Fetch token mints you've already sold (using Helius)
+async function fetchPreviouslySoldTokens() {
+  const apiKey = process.env.HELIUS_API_KEY;
+  const wallet = process.env.WALLET_ADDRESS;
+  const url = `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${apiKey}&type=SWAP&limit=1000`;
+
+  try {
+    const { data } = await axios.get(url);
+    const soldMints = new Set();
+
+    for (const tx of data) {
+      const accounts = tx?.tokenTransfers || [];
+      for (const acc of accounts) {
+        if (acc?.fromUserAccount === wallet && parseFloat(acc?.tokenAmount) > 0) {
+          soldMints.add(acc.mint);
+        }
+      }
+    }
+
+    return Array.from(soldMints);
+  } catch (err) {
+    console.error('Failed to fetch past tokens:', err.message);
+    return [];
+  }
 }
 
 app.post('/webhook', async (req, res) => {
-  console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
+  console.log('✅ Webhook received');
+
+  let soldTokens = loadSoldTokens();
+  const alreadySold = new Set(soldTokens);
 
   try {
-    const events = req.body; // usually an array
-    if (!Array.isArray(events)) return res.sendStatus(400);
+    const body = req.body;
+    if (!Array.isArray(body)) return res.sendStatus(400);
 
-    const alertState = loadAlertState();
+    for (const event of body) {
+      const accounts = event.accountData || [];
 
-    for (const event of events) {
-      const accountData = event.accountData || [];
-      for (const account of accountData) {
-        const tokenChanges = account.tokenBalanceChanges || [];
-        for (const tokenChange of tokenChanges) {
-          const amount = parseInt(tokenChange.rawTokenAmount.tokenAmount);
-          const decimals = tokenChange.rawTokenAmount.decimals || 0;
-          const amountAbsolute = Math.abs(amount) / (10 ** decimals);
+      for (const acc of accounts) {
+        const changes = acc.tokenBalanceChanges || [];
 
-          // Detect sell: negative amount and amount > 1 token
-          if (amount < 0 && amountAbsolute > 1) {
-            const mint = tokenChange.mint;
+        for (const token of changes) {
+          const isSell = parseInt(token.rawTokenAmount.tokenAmount) < 0;
+          const mint = token.mint;
 
-            // Skip if alert already sent for this token mint
-            if (alertState[mint]) {
-              console.log(`⚠️ Alert already sent for token mint ${mint}, skipping.`);
-              continue;
-            }
+          if (isSell && !alreadySold.has(mint)) {
+            // Send Telegram Alert
+            const msg = `🚨 First Token Sell Detected!\nToken Symbol: ${mint}\nContract Address: ${mint}`;
+            const tgUrl = `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`;
 
-            // Fetch token metadata from Helius
-            let tokenSymbol = mint; // fallback to mint if no metadata
-            try {
-              const metadataRes = await axios.get(`https://api.helius.xyz/v0/tokens/metadata`, {
-                params: {
-                  'api-key': process.env.HELIUS_API_KEY,
-                  mintAccounts: mint,
-                },
-              });
-              if (metadataRes.data && metadataRes.data.length > 0) {
-                tokenSymbol = metadataRes.data[0].symbol || mint;
-              }
-            } catch (err) {
-              console.warn('⚠️ Failed to fetch token metadata:', err.message);
-            }
-
-            const contractAddress = mint;
-            const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${contractAddress}`;
-
-            // Send Telegram message
-            await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
+            await axios.post(tgUrl, {
               chat_id: process.env.TG_CHAT_ID,
-              text: message,
-              parse_mode: 'Markdown',
+              text: msg,
+              parse_mode: 'Markdown'
             });
 
-            console.log('✅ Telegram alert sent for mint:', mint);
-
-            // Mark alert sent for this token mint
-            alertState[mint] = true;
-            saveAlertState(alertState);
-
-            // Only alert once per webhook call per token mint
-            // continue to next tokenChange
+            console.log(`✅ Alert sent for mint: ${mint}`);
+            alreadySold.add(mint);
+            soldTokens.push(mint);
+            saveSoldTokens(soldTokens);
+          } else if (alreadySold.has(mint)) {
+            console.log(`⚠️ Alert already sent for token mint ${mint}, skipping.`);
           }
         }
       }
     }
 
     res.sendStatus(200);
-  } catch (error) {
-    console.error('Webhook handler error:', error);
+  } catch (err) {
+    console.error('Webhook error:', err);
     res.sendStatus(500);
   }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅ Listening on port ${PORT}`);
+  const previouslySold = await fetchPreviouslySoldTokens();
+  saveSoldTokens(previouslySold);
+  console.log(`📦 Loaded ${previouslySold.length} previously sold token mints from history.`);
 });
+
 

@@ -41,7 +41,8 @@ async function fetchPastSoldTokens() {
     data.forEach((tx) => {
       if (!Array.isArray(tx.tokenTransfers)) return;
       tx.tokenTransfers.forEach((t) => {
-        if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
+        // Fix here: only add tokens that were SOLD (tokenAmount < 0)
+        if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) < 0) {
           tokenMints.add(t.mint);
         }
       });
@@ -113,4 +114,5 @@ app.listen(PORT, async () => {
   await fetchPastSoldTokens();
   console.log(`✅ Listening on port ${PORT}`);
 });
+
 

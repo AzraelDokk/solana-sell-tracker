@@ -6,7 +6,10 @@ const app = express();
 app.use(express.json());
 
 const ALERT_FILE = './alertSent.json';
+
+// Replace this with your wallet address exactly
 const WALLET_ADDRESS = 'G4UqKTzrao2mV1WAah8F7QRS8GYHGMgyaRb27ZZFxki1';
+
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TG_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TG_CHAT_ID;
@@ -31,7 +34,7 @@ function savePreviouslySold() {
   fs.writeFileSync(ALERT_FILE, JSON.stringify({ tokens: Array.from(alreadySold) }));
 }
 
-// Fetch past token sells from Helius (SWAP type only)
+// Fetch past token sells from Helius API (SWAP type only)
 async function fetchPastSoldTokens() {
   try {
     const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&type=SWAP`;
@@ -39,10 +42,10 @@ async function fetchPastSoldTokens() {
     const tokenMints = new Set();
 
     data.forEach((tx) => {
-      if (!tx.events || !tx.events.swap || !Array.isArray(tx.events.swap.tokenInputs)) return;
-      tx.events.swap.tokenInputs.forEach((input) => {
-        if (input.fromUserAccount === WALLET_ADDRESS && input.mint) {
-          tokenMints.add(input.mint);
+      if (!Array.isArray(tx.tokenTransfers)) return;
+      tx.tokenTransfers.forEach((t) => {
+        if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
+          tokenMints.add(t.mint);
         }
       });
     });
@@ -55,46 +58,51 @@ async function fetchPastSoldTokens() {
   }
 }
 
-// Handle incoming Helius webhook
+// Webhook endpoint to handle incoming Helius events
 app.post('/webhook', async (req, res) => {
-  console.log('✅ Webhook received:', JSON.stringify(req.body, null, 2));
-
   const events = req.body;
   if (!Array.isArray(events)) return res.sendStatus(400);
 
   for (const event of events) {
-    const swapEvent = event.events?.swap;
-    if (!swapEvent) continue;
+    const accountData = event.accountData || [];
 
-    const tokenInputs = swapEvent.tokenInputs || [];
+    for (const account of accountData) {
+      const changes = account.tokenBalanceChanges || [];
 
-    for (const input of tokenInputs) {
-      if (input.fromUserAccount === WALLET_ADDRESS && !alreadySold.has(input.mint)) {
-        const tokenSymbol = input.mint; // You can replace this with a lookup for symbol if desired
-        const contractAddress = input.mint;
+      for (const change of changes) {
+        const { userAccount, rawTokenAmount, mint } = change;
 
-        const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${contractAddress}`;
+        // Check: only alert on first sell (negative tokenAmount) for this token mint
+        if (
+          userAccount === WALLET_ADDRESS &&
+          parseFloat(rawTokenAmount.tokenAmount) < 0 &&
+          !alreadySold.has(mint)
+        ) {
+          const tokenSymbol = mint; // Optional: you can fetch real symbol via token metadata API later
+          const contractAddress = mint;
 
-        try {
-          await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            chat_id: TELEGRAM_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown',
-          });
+          const message = `🚨 First Token Sell Detected!\nToken Symbol: ${tokenSymbol}\nContract Address: ${contractAddress}`;
 
-          console.log('✅ Telegram alert sent!');
-          alreadySold.add(input.mint);
-          savePreviouslySold();
-        } catch (e) {
-          console.error('❌ Error sending Telegram message:', e.response?.data || e.message);
+          try {
+            await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              chat_id: TELEGRAM_CHAT_ID,
+              text: message,
+              parse_mode: 'Markdown'
+            });
+
+            console.log('✅ Telegram alert sent!');
+            alreadySold.add(mint);
+            savePreviouslySold();
+          } catch (e) {
+            console.error('❌ Error sending Telegram message:', e.response?.data || e.message);
+          }
+
+          return res.sendStatus(200);
         }
-
-        return res.sendStatus(200);
       }
     }
   }
 
-  console.log('ℹ️ No new sells detected.');
   res.sendStatus(200);
 });
 
@@ -106,4 +114,3 @@ app.listen(PORT, async () => {
   await fetchPastSoldTokens();
   console.log(`✅ Listening on port ${PORT}`);
 });
-

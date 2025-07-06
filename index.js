@@ -6,7 +6,6 @@ app.use(express.json());
 
 const SOLD_TOKENS_FILE = './soldTokens.json';
 
-// Load previously sold tokens
 function loadSoldTokens() {
   try {
     return JSON.parse(fs.readFileSync(SOLD_TOKENS_FILE, 'utf8'));
@@ -15,12 +14,10 @@ function loadSoldTokens() {
   }
 }
 
-// Save updated list of sold tokens
 function saveSoldTokens(tokens) {
   fs.writeFileSync(SOLD_TOKENS_FILE, JSON.stringify(tokens));
 }
 
-// Fetch token mints you've already sold (using Helius)
 async function fetchPreviouslySoldTokens() {
   const apiKey = process.env.HELIUS_API_KEY;
   const wallet = process.env.WALLET_ADDRESS;
@@ -31,10 +28,10 @@ async function fetchPreviouslySoldTokens() {
     const soldMints = new Set();
 
     for (const tx of data) {
-      const accounts = tx?.tokenTransfers || [];
-      for (const acc of accounts) {
-        if (acc?.fromUserAccount === wallet && parseFloat(acc?.tokenAmount) > 0) {
-          soldMints.add(acc.mint);
+      const transfers = tx.tokenTransfers || [];
+      for (const t of transfers) {
+        if (t.fromUserAccount === wallet && parseFloat(t.tokenAmount) > 0) {
+          soldMints.add(t.mint);
         }
       }
     }
@@ -51,46 +48,73 @@ app.post('/webhook', async (req, res) => {
 
   let soldTokens = loadSoldTokens();
   const alreadySold = new Set(soldTokens);
+  const wallet = process.env.WALLET_ADDRESS;
 
   try {
-    const body = req.body;
-    if (!Array.isArray(body)) return res.sendStatus(400);
+    const events = req.body;
+    if (!Array.isArray(events)) return res.sendStatus(400);
 
-    for (const event of body) {
+    for (const event of events) {
       const accounts = event.accountData || [];
 
+      let receivedSolOrUSDC = false;
+      let soldTokenMint = null;
+
       for (const acc of accounts) {
-        const changes = acc.tokenBalanceChanges || [];
+        const tokenChanges = acc.tokenBalanceChanges || [];
 
-        for (const token of changes) {
-          const isSell = parseInt(token.rawTokenAmount.tokenAmount) < 0;
-          const mint = token.mint;
-
-          if (isSell && !alreadySold.has(mint)) {
-            // Send Telegram Alert
-            const msg = `🚨 First Token Sell Detected!\nToken Symbol: ${mint}\nContract Address: ${mint}`;
-            const tgUrl = `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`;
-
-            await axios.post(tgUrl, {
-              chat_id: process.env.TG_CHAT_ID,
-              text: msg,
-              parse_mode: 'Markdown'
-            });
-
-            console.log(`✅ Alert sent for mint: ${mint}`);
-            alreadySold.add(mint);
-            soldTokens.push(mint);
-            saveSoldTokens(soldTokens);
-          } else if (alreadySold.has(mint)) {
-            console.log(`⚠️ Alert already sent for token mint ${mint}, skipping.`);
+        // Detect a token leaving your wallet (sell)
+        for (const token of tokenChanges) {
+          if (
+            token.userAccount === wallet &&
+            parseFloat(token.rawTokenAmount.tokenAmount) < 0 &&
+            token.mint !== "So11111111111111111111111111111111111111112" // Not native SOL
+          ) {
+            soldTokenMint = token.mint;
           }
         }
+
+        // Detect if your wallet received SOL or USDC
+        if (acc.account === wallet) {
+          if (acc.nativeBalanceChange > 0) {
+            receivedSolOrUSDC = true;
+          }
+
+          for (const token of acc.tokenBalanceChanges || []) {
+            if (
+              token.userAccount === wallet &&
+              parseFloat(token.rawTokenAmount.tokenAmount) > 0 &&
+              (token.mint === "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" || // USDC
+               token.mint === "So11111111111111111111111111111111111111112")  // Native SOL
+            ) {
+              receivedSolOrUSDC = true;
+            }
+          }
+        }
+      }
+
+      if (soldTokenMint && receivedSolOrUSDC && !alreadySold.has(soldTokenMint)) {
+        const msg = `🚨 First Token Sell Detected!\nToken Symbol: ${soldTokenMint}\nContract Address: ${soldTokenMint}`;
+        await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
+          chat_id: process.env.TG_CHAT_ID,
+          text: msg,
+          parse_mode: 'Markdown'
+        });
+
+        console.log(`✅ Alert sent for mint: ${soldTokenMint}`);
+        alreadySold.add(soldTokenMint);
+        soldTokens.push(soldTokenMint);
+        saveSoldTokens(soldTokens);
+      } else if (soldTokenMint && alreadySold.has(soldTokenMint)) {
+        console.log(`⚠️ Alert already sent for token mint ${soldTokenMint}, skipping.`);
+      } else {
+        console.log('ℹ️ No qualifying sell detected.');
       }
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error('Webhook error:', err);
+    console.error('Webhook handler error:', err);
     res.sendStatus(500);
   }
 });
@@ -98,9 +122,9 @@ app.post('/webhook', async (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
   console.log(`✅ Listening on port ${PORT}`);
-  const previouslySold = await fetchPreviouslySoldTokens();
-  saveSoldTokens(previouslySold);
-  console.log(`📦 Loaded ${previouslySold.length} previously sold token mints from history.`);
+  const prev = await fetchPreviouslySoldTokens();
+  saveSoldTokens(prev);
+  console.log(`📦 Loaded ${prev.length} previously sold token mints from history.`);
 });
 
 

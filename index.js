@@ -6,25 +6,22 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-const TELEGRAM_BOT_TOKEN = process.env.TG_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TG_CHAT_ID;
+// Load environment variables
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
 const MONGODB_URI = process.env.MONGODB_URI;
 
-console.log('--- Env Variable Check ---');
-console.log('HELIUS_API_KEY:', HELIUS_API_KEY ? 'Present' : 'Missing');
-console.log('WALLET_ADDRESS:', WALLET_ADDRESS ? WALLET_ADDRESS : 'Missing');
-console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_BOT_TOKEN ? 'Present' : 'Missing');
-console.log('TELEGRAM_CHAT_ID:', TELEGRAM_CHAT_ID ? 'Present' : 'Missing');
-console.log('MONGODB_URI:', MONGODB_URI ? 'Present' : 'Missing');
+// Basic env check
+console.log("--- Env Variable Check ---");
+console.log("HELIUS_API_KEY:", HELIUS_API_KEY ? "Present" : "Missing");
+console.log("WALLET_ADDRESS:", WALLET_ADDRESS);
+console.log("TELEGRAM_BOT_TOKEN:", TELEGRAM_BOT_TOKEN ? "Present" : "Missing");
+console.log("TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID ? "Present" : "Missing");
+console.log("MONGODB_URI:", MONGODB_URI ? "Present" : "Missing");
 
-if (!HELIUS_API_KEY || !WALLET_ADDRESS || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !MONGODB_URI) {
-  console.error('❌ Missing one or more required environment variables. Exiting.');
-  process.exit(1);
-}
-
-// Define Mongoose schema and model
+// MongoDB schema
 const tokenSchema = new mongoose.Schema({
   mint: { type: String, unique: true },
   firstSeen: Date,
@@ -38,11 +35,10 @@ async function connectToMongo() {
     console.log('📦 Connected to MongoDB.');
   } catch (e) {
     console.error('❌ MongoDB connection failed:', e.message);
-    process.exit(1);
   }
 }
 
-// Fetch all historical token sells via paginated Helius API
+// Historical fetch using Helius POST with pagination
 async function fetchHistoricalSells() {
   console.log('📦 Starting historical sell fetch...');
   let before = null;
@@ -50,10 +46,15 @@ async function fetchHistoricalSells() {
 
   try {
     while (true) {
-      let url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&type=SWAP&limit=50`;
-      if (before) url += `&before=${before}`;
+      const url = `https://api.helius.xyz/v0/transactions/address?api-key=${HELIUS_API_KEY}`;
+      const body = {
+        address: WALLET_ADDRESS,
+        limit: 50,
+        filters: [{ type: "swap" }]
+      };
+      if (before) body.before = before;
 
-      const response = await axios.get(url);
+      const response = await axios.post(url, body);
       const data = response.data;
 
       if (!Array.isArray(data) || data.length === 0) break;
@@ -62,7 +63,6 @@ async function fetchHistoricalSells() {
         if (!tx.tokenTransfers) continue;
 
         for (const t of tx.tokenTransfers) {
-          // Sell detection: fromUserAccount === wallet and tokenAmount > 0 (token sent out)
           if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
             const exists = await Token.exists({ mint: t.mint });
             if (!exists) {
@@ -73,7 +73,7 @@ async function fetchHistoricalSells() {
         }
       }
 
-      before = data[data.length - 1].signature; // paginate
+      before = data[data.length - 1].signature;
       console.log(`📦 Fetched batch, continuing before ${before}...`);
     }
 
@@ -83,7 +83,7 @@ async function fetchHistoricalSells() {
   }
 }
 
-// Webhook handler for real-time sells
+// Handle webhook from Helius
 app.post('/webhook', async (req, res) => {
   const events = req.body;
   if (!Array.isArray(events)) return res.sendStatus(400);
@@ -97,14 +97,14 @@ app.post('/webhook', async (req, res) => {
       for (const change of changes) {
         const { userAccount, rawTokenAmount, mint } = change;
 
-        // Detect sell: userAccount === wallet and negative tokenAmount (sent tokens)
+        // Detect a sell (negative token amount from our wallet)
         if (userAccount === WALLET_ADDRESS && parseFloat(rawTokenAmount.tokenAmount) < 0) {
           const exists = await Token.exists({ mint });
 
           if (!exists) {
             await Token.create({ mint, firstSeen: new Date() });
 
-            const message = `🚨 First Token Sell Detected!\nToken Mint: ${mint}\nContract Address: ${mint}`;
+            const message = `🚨 First Token Sell Detected!\nToken Mint: ${mint}`;
             try {
               await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
                 chat_id: TELEGRAM_CHAT_ID,
@@ -117,7 +117,7 @@ app.post('/webhook', async (req, res) => {
               console.error('❌ Telegram error:', e.message);
             }
           } else {
-            console.log(`⚠️ Alert already sent for token ${mint}, skipping.`);
+            console.log(`⚠️ Already alerted for ${mint}, skipping.`);
           }
         }
       }
@@ -134,4 +134,3 @@ app.listen(PORT, async () => {
   await fetchHistoricalSells();
   console.log(`✅ Listening on port ${PORT}`);
 });
-

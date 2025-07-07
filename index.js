@@ -10,119 +10,117 @@ const TELEGRAM_BOT_TOKEN = process.env.TG_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TG_CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
-const MONGO_URI = process.env.MONGODB_URI;  // <-- Use MONGODB_URI here
+const MONGODB_URI = process.env.MONGODB_URI;
 
-// Define token schema and model
+const TOKEN_COLLECTION = 'tokens';
+
 const tokenSchema = new mongoose.Schema({
   mint: { type: String, unique: true },
   firstSeen: Date,
 });
 const Token = mongoose.model('Token', tokenSchema);
 
-// Connect to MongoDB
 async function connectToMongo() {
   try {
-    await mongoose.connect(MONGO_URI, {
-      // These options are now defaults, no need to specify but harmless to keep
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
+    await mongoose.connect(MONGODB_URI);
     console.log('📦 Connected to MongoDB.');
   } catch (e) {
     console.error('❌ MongoDB connection failed:', e.message);
   }
 }
 
-// Fetch all historical token sells from Helius (paging with cursor)
+// Fetch all transactions batch by batch using pagination cursor
 async function fetchHistoricalSells() {
   console.log('📦 Starting historical sell fetch...');
-  let cursor = null;
+  let before = null;
   let totalInserted = 0;
+  while (true) {
+    try {
+      const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions${before ? `?before=${before}` : ''}`;
+      const headers = { 'api-key': HELIUS_API_KEY };
+      const response = await axios.get(url, { headers });
 
-  try {
-    do {
-      const url = new URL(`https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions`);
-      url.searchParams.append('api-key', HELIUS_API_KEY);
-      url.searchParams.append('type', 'SWAP');
-      if (cursor) url.searchParams.append('before', cursor);
-
-      const { data } = await axios.get(url.toString());
-      if (!Array.isArray(data) || data.length === 0) break;
+      const data = response.data;
+      if (!data || data.length === 0) {
+        break;
+      }
 
       for (const tx of data) {
-        if (!tx.tokenTransfers) continue;
+        before = tx.signature; // for next pagination
 
-        for (const t of tx.tokenTransfers) {
-          // Check if this is a sell from our wallet with positive amount
-          if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
-            const exists = await Token.exists({ mint: t.mint });
-            if (!exists) {
-              await Token.create({ mint: t.mint, firstSeen: new Date() });
-              totalInserted++;
+        // Detect swap/sell transactions by inspecting inner instructions or log messages
+        const isSell = tx.transactionType === 'swap' || tx.logMessages?.some(msg => msg.includes('swap'));
+        if (!isSell) continue;
+
+        // Extract token mints sold in this tx from tokenTransfers where 'fromUserAccount' = wallet
+        const soldMints = new Set();
+        if (tx.tokenTransfers) {
+          for (const tt of tx.tokenTransfers) {
+            if (tt.fromUserAccount === WALLET_ADDRESS && parseFloat(tt.tokenAmount) > 0) {
+              soldMints.add(tt.mint);
             }
+          }
+        }
+
+        for (const mint of soldMints) {
+          const exists = await Token.exists({ mint });
+          if (!exists) {
+            await Token.create({ mint, firstSeen: new Date(tx.timestamp * 1000) });
+            totalInserted++;
+            console.log(`📦 Inserted historical sell: ${mint}`);
           }
         }
       }
 
-      cursor = data[data.length - 1].signature;
-      console.log(`📦 Fetched batch, continuing before ${cursor}...`);
-
-      // Safety break if something goes wrong with paging
-      if (!cursor) break;
-
-    } while (true);
-
-    console.log(`📦 Finished fetching. Total unique sells inserted: ${totalInserted}`);
-  } catch (error) {
-    console.error('❌ Failed to fetch historical sells:', error.message);
+      console.log(`📦 Fetched batch, continuing before ${before}...`);
+    } catch (err) {
+      if (err.response && err.response.status === 404) {
+        console.log('📦 No more transactions found.');
+        break;
+      }
+      console.error('❌ Error fetching historical sells:', err.message);
+      break;
+    }
   }
+  console.log(`📦 Finished fetching. Total unique sells inserted: ${totalInserted}`);
 }
 
-// Webhook endpoint for real-time sells
+// Webhook handler for real-time sells
 app.post('/webhook', async (req, res) => {
   const events = req.body;
   if (!Array.isArray(events)) return res.sendStatus(400);
 
   for (const event of events) {
-    const accounts = event.accountData || [];
+    if (!event.tokenTransfers) continue;
 
-    for (const account of accounts) {
-      const changes = account.tokenBalanceChanges || [];
-
-      for (const change of changes) {
-        const { userAccount, rawTokenAmount, mint } = change;
-
-        // Detect sell: negative token amount from our wallet
-        if (userAccount === WALLET_ADDRESS && parseFloat(rawTokenAmount.tokenAmount) < 0) {
-          const exists = await Token.exists({ mint });
-
-          if (!exists) {
-            await Token.create({ mint, firstSeen: new Date() });
-
-            const message = `🚨 First Token Sell Detected!\nToken Mint: ${mint}\nWallet: ${WALLET_ADDRESS}`;
-            try {
-              await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-                chat_id: TELEGRAM_CHAT_ID,
-                text: message,
-                parse_mode: 'Markdown',
-              });
-
-              console.log('✅ Alert sent for', mint);
-            } catch (e) {
-              console.error('❌ Telegram error:', e.message);
-            }
-          } else {
-            console.log(`⚠️ Alert already sent for token ${mint}, skipping.`);
+    for (const tt of event.tokenTransfers) {
+      if (tt.fromUserAccount === WALLET_ADDRESS && parseFloat(tt.tokenAmount) > 0) {
+        const mint = tt.mint;
+        const exists = await Token.exists({ mint });
+        if (!exists) {
+          await Token.create({ mint, firstSeen: new Date() });
+          const message = `🚨 First Token Sell Detected!\nToken Mint: ${mint}`;
+          try {
+            await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              chat_id: TELEGRAM_CHAT_ID,
+              text: message,
+              parse_mode: 'Markdown',
+            });
+            console.log('✅ Alert sent for', mint);
+          } catch (e) {
+            console.error('❌ Telegram error:', e.message);
           }
+        } else {
+          console.log(`⚠️ Already alerted for token ${mint}, skipping.`);
         }
       }
     }
   }
-
   res.sendStatus(200);
 });
 
 const PORT = process.env.PORT || 10000;
+
 app.listen(PORT, async () => {
   await connectToMongo();
   await fetchHistoricalSells();

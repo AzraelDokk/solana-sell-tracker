@@ -10,17 +10,16 @@ const TELEGRAM_BOT_TOKEN = process.env.TG_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TG_CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
-const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
+const MONGO_URI = process.env.MONGODB_URI;
 
-const BASE_URL = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?type=SWAP&api-key=${HELIUS_API_KEY}`;
-
+// Mongo Schema
 const tokenSchema = new mongoose.Schema({
   mint: { type: String, unique: true },
   firstSeen: Date
 });
 const Token = mongoose.model('Token', tokenSchema);
 
-// Connect to MongoDB
+// Connect Mongo
 async function connectToMongo() {
   try {
     await mongoose.connect(MONGO_URI);
@@ -30,45 +29,45 @@ async function connectToMongo() {
   }
 }
 
-// Fetch ALL historical sells
-async function fetchAllHistoricalSells() {
-  let beforeTx = null;
-  let inserted = 0;
+// Fetch historical token sells (paginated)
+async function fetchHistoricalSells() {
   console.log('📦 Starting historical sell fetch...');
+  const baseURL = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?type=SWAP&limit=100&api-key=${HELIUS_API_KEY}`;
+  let before = null;
+  let totalInserted = 0;
 
   while (true) {
     try {
-      const url = beforeTx ? `${BASE_URL}&before=${beforeTx}` : BASE_URL;
+      const url = before ? `${baseURL}&before=${before}` : baseURL;
       const { data } = await axios.get(url);
-
-      if (!data.length) break;
+      if (!data || data.length === 0) break;
 
       for (const tx of data) {
-        if (!tx.tokenTransfers) continue;
+        before = tx.signature;
 
+        if (!tx.tokenTransfers) continue;
         for (const t of tx.tokenTransfers) {
           if (t.fromUserAccount === WALLET_ADDRESS && parseFloat(t.tokenAmount) > 0) {
             const exists = await Token.exists({ mint: t.mint });
             if (!exists) {
               await Token.create({ mint: t.mint, firstSeen: new Date(tx.timestamp * 1000) });
-              inserted++;
+              totalInserted++;
             }
           }
         }
       }
 
-      beforeTx = data[data.length - 1].signature;
-      console.log(`📦 Fetched batch, continuing before ${beforeTx}...`);
+      console.log(`📦 Fetched batch, continuing before ${before}...`);
     } catch (e) {
       console.error('❌ Failed to fetch historical sells:', e.message);
       break;
     }
   }
 
-  console.log(`📦 Finished fetching. Total unique sells inserted: ${inserted}`);
+  console.log(`📦 Finished fetching. Total unique sells inserted: ${totalInserted}`);
 }
 
-// Handle incoming webhook from Helius
+// Webhook listener
 app.post('/webhook', async (req, res) => {
   const events = req.body;
   if (!Array.isArray(events)) return res.sendStatus(400);
@@ -82,23 +81,22 @@ app.post('/webhook', async (req, res) => {
       for (const change of changes) {
         const { userAccount, rawTokenAmount, mint } = change;
 
-        if (
-          userAccount === WALLET_ADDRESS &&
-          parseFloat(rawTokenAmount?.tokenAmount || 0) < 0
-        ) {
+        if (userAccount === WALLET_ADDRESS && parseFloat(rawTokenAmount.tokenAmount) < 0) {
           const exists = await Token.exists({ mint });
 
           if (!exists) {
             await Token.create({ mint, firstSeen: new Date() });
 
-            const message = `🚨 *First Token Sell Detected!*\n\n🪙 Token: \`${mint}\`\n🔗 https://solscan.io/token/${mint}`;
+            const message = `🚨 *First Token Sell Detected!*\nToken Mint: \`${mint}\``;
+
             try {
               await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
                 chat_id: TELEGRAM_CHAT_ID,
                 text: message,
                 parse_mode: 'Markdown'
               });
-              console.log(`✅ Alert sent for ${mint}`);
+
+              console.log('✅ Alert sent for', mint);
             } catch (e) {
               console.error('❌ Telegram error:', e.message);
             }
@@ -113,11 +111,12 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// Start the server
+// Start server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
   await connectToMongo();
-  await fetchAllHistoricalSells();
+  await fetchHistoricalSells();
   console.log(`✅ Listening on port ${PORT}`);
 });
+
 

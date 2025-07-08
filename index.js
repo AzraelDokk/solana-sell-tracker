@@ -1,20 +1,19 @@
 require('dotenv').config();
-const express = require('express');
-const mongoose = require('mongoose');
 const axios = require('axios');
+const mongoose = require('mongoose');
+const TelegramBot = require('node-telegram-bot-api');
+const cron = require('node-cron');
 
-const app = express();
-app.use(express.json());
+const {
+  HELIUS_API_KEY,
+  WALLET_ADDRESS,
+  TG_TOKEN,
+  TG_CHAT_ID,
+  MONGODB_URI,
+  PORT
+} = process.env;
 
-// Load environment variables using YOUR keys
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-const MONGODB_URI = process.env.MONGODB_URI;
-const PORT = process.env.PORT || 10000;
-const TG_TOKEN = process.env.TG_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
-
-// Debug env status
+// Basic env check
 console.log("--- Env Variable Check ---");
 console.log("HELIUS_API_KEY:", HELIUS_API_KEY ? "Present" : "Missing");
 console.log("WALLET_ADDRESS:", WALLET_ADDRESS);
@@ -22,111 +21,86 @@ console.log("TG_TOKEN:", TG_TOKEN ? "Present" : "Missing");
 console.log("TG_CHAT_ID:", TG_CHAT_ID ? "Present" : "Missing");
 console.log("MONGODB_URI:", MONGODB_URI ? "Present" : "Missing");
 
-// MongoDB schema
+const bot = new TelegramBot(TG_TOKEN);
+const API_URL = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('📦 Connected to MongoDB.'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
+
 const tokenSchema = new mongoose.Schema({
-  mint: { type: String, unique: true },
-  firstSeen: Date,
+  mint: String,
+  alerted: Boolean,
+  createdAt: Date
 });
 const Token = mongoose.model('Token', tokenSchema);
 
-// Connect to MongoDB
-async function connectToMongo() {
+// === Get token creation time ===
+async function getTokenCreationTime(mint) {
   try {
-    await mongoose.connect(MONGODB_URI);
-    console.log('📦 Connected to MongoDB.');
+    const url = `https://api.helius.xyz/v0/tokens/${mint}/metadata?api-key=${HELIUS_API_KEY}`;
+    const { data } = await axios.get(url);
+    return new Date(data.onChainCollectionDetails?.createdAt || data.createdAt || 0);
   } catch (e) {
-    console.error('❌ MongoDB connection failed:', e.message);
+    console.error(`⚠️ Error fetching creation time for ${mint}:`, e.message);
+    return null;
   }
 }
 
-// Fetch historical sells (with pagination)
-async function fetchHistoricalSells() {
-  console.log('📦 Starting historical sell fetch...');
-  let before = null;
-  let inserted = 0;
+// === Send Telegram Alert ===
+async function sendAlert(mint) {
+  const msg = `✅ First sell detected for new token:\n\n${mint}`;
+  await bot.sendMessage(TG_CHAT_ID, msg);
+  console.log(`✅ Alert sent for ${mint}`);
+}
 
+// === Check recent transactions every 5 minutes ===
+async function checkForNewSells() {
   try {
-    while (true) {
-      const url = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}&limit=100&before=${before || ''}`;
-      const { data } = await axios.get(url);
-      if (!data || data.length === 0) break;
+    const { data } = await axios.get(API_URL);
+    const txs = data.filter(tx => tx.type === 'SWAP');
 
-      for (const tx of data) {
-        if (tx.type !== 'SWAP') continue;
+    for (const tx of txs) {
+      const mint = tx.tokenTransfers?.find(t => t.fromUserAccount === WALLET_ADDRESS)?.mint;
+      if (!mint) continue;
 
-        const tokenTransfers = tx.tokenTransfers || [];
-        for (const transfer of tokenTransfers) {
-          if (
-            transfer.fromUserAccount === WALLET_ADDRESS &&
-            parseFloat(transfer.tokenAmount) > 0
-          ) {
-            const exists = await Token.exists({ mint: transfer.mint });
-            if (!exists) {
-              await Token.create({ mint: transfer.mint, firstSeen: new Date() });
-              inserted++;
-            }
-          }
-        }
+      const exists = await Token.findOne({ mint });
+      if (exists) {
+        console.log(`⚠️ Already alerted for ${mint}, skipping.`);
+        continue;
       }
 
-      before = data[data.length - 1].signature;
-      console.log(`📦 Fetched batch, continuing before ${before}...`);
-    }
-  } catch (err) {
-    console.error('❌ Error fetching historical sells:', err.response?.status || err.message);
-  }
+      const creationTime = await getTokenCreationTime(mint);
+      if (!creationTime) continue;
 
-  console.log(`📦 Finished fetching. Total unique sells inserted: ${inserted}`);
+      const now = new Date();
+      const ageInMs = now - creationTime;
+      const twoHours = 2 * 60 * 60 * 1000;
+
+      if (ageInMs <= twoHours) {
+        await sendAlert(mint);
+      } else {
+        console.log(`⏱️ Sell for ${mint} ignored (older than 2h).`);
+      }
+
+      await Token.create({ mint, alerted: true, createdAt: now });
+    }
+  } catch (e) {
+    console.error("❌ Error during check:", e.message);
+  }
 }
 
-// Handle webhook POST from Helius
-app.post('/webhook', async (req, res) => {
-  const events = req.body;
-  if (!Array.isArray(events)) return res.sendStatus(400);
+// === Run every 5 mins ===
+cron.schedule('*/5 * * * *', checkForNewSells);
 
-  for (const event of events) {
-    const accounts = event.accountData || [];
+// Initial run
+checkForNewSells();
 
-    for (const account of accounts) {
-      const changes = account.tokenBalanceChanges || [];
-
-      for (const change of changes) {
-        const { userAccount, rawTokenAmount, mint } = change;
-
-        if (
-          userAccount === WALLET_ADDRESS &&
-          parseFloat(rawTokenAmount.tokenAmount) < 0
-        ) {
-          const exists = await Token.exists({ mint });
-          if (!exists) {
-            await Token.create({ mint, firstSeen: new Date() });
-
-            const msg = `🚨 First Token Sell Detected!\nToken: ${mint}\nhttps://solscan.io/token/${mint}`;
-            try {
-              await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-                chat_id: TG_CHAT_ID,
-                text: msg,
-                parse_mode: 'Markdown',
-              });
-              console.log(`✅ Alert sent for ${mint}`);
-            } catch (e) {
-              console.error('❌ Telegram error:', e.message);
-            }
-          } else {
-            console.log(`⚠️ Already alerted for ${mint}, skipping.`);
-          }
-        }
-      }
-    }
-  }
-
-  res.sendStatus(200);
+const express = require('express');
+const app = express();
+app.get('/', (_, res) => res.send('✅ Solana Sell Tracker is live.'));
+app.listen(PORT || 10000, () => {
+  console.log(`✅ Listening on port ${PORT || 10000}`);
 });
 
-// Start server
-app.listen(PORT, async () => {
-  await connectToMongo();
-  await fetchHistoricalSells();
-  console.log(`✅ Listening on port ${PORT}`);
-});
 

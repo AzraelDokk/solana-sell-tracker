@@ -5,20 +5,21 @@ const fetch = require('node-fetch');
 const cron = require('node-cron');
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-const WALLET_ADDRESS = process.env.WALLET_ADDRESS.toLowerCase();
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!HELIUS_API_KEY || !WALLET_ADDRESS || !TG_TOKEN || !TG_CHAT_ID || !MONGODB_URI) {
-  console.error('❌ Missing environment variables');
+  console.error('❌ Missing one or more environment variables!');
   process.exit(1);
 }
 
 const heliusBaseUrl = `https://api.helius.xyz/v0/addresses/${WALLET_ADDRESS}/transactions?api-key=${HELIUS_API_KEY}`;
 const tokenMetaUrl = (mint) => `https://api.helius.xyz/v0/mints/${mint}?api-key=${HELIUS_API_KEY}`;
 
-const bot = new TelegramBot(TG_TOKEN);
+const bot = new TelegramBot(TG_TOKEN, { polling: false });
+
 let db, alertsCollection;
 
 async function connectDB() {
@@ -30,7 +31,8 @@ async function connectDB() {
 }
 
 async function hasAlreadyAlerted(tokenMint) {
-  return !!(await alertsCollection.findOne({ tokenMint }));
+  const record = await alertsCollection.findOne({ tokenMint });
+  return !!record;
 }
 
 async function markAlerted(tokenMint) {
@@ -40,10 +42,18 @@ async function markAlerted(tokenMint) {
 async function getTokenCreationTimestamp(tokenMint) {
   try {
     const res = await fetch(tokenMetaUrl(tokenMint));
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log(`⚠️ Failed to fetch token metadata for ${tokenMint}, status: ${res.status}`);
+      return null;
+    }
     const data = await res.json();
-    return data?.creationTime || null;
-  } catch {
+    if (!data || !data.creationTime) {
+      console.log(`⚠️ No creationTime found for token ${tokenMint}`);
+      return null;
+    }
+    return data.creationTime; // Unix timestamp in seconds
+  } catch (error) {
+    console.log(`⚠️ Error fetching token metadata for ${tokenMint}:`, error);
     return null;
   }
 }
@@ -51,56 +61,81 @@ async function getTokenCreationTimestamp(tokenMint) {
 async function checkForNewSells() {
   try {
     const res = await fetch(heliusBaseUrl);
-    if (!res.ok) return;
+    if (!res.ok) {
+      console.log(`⚠️ Failed to fetch transactions, status: ${res.status}`);
+      return;
+    }
     const transactions = await res.json();
-    if (!Array.isArray(transactions) || transactions.length === 0) return;
+    if (!Array.isArray(transactions) || transactions.length === 0) {
+      console.log('ℹ️ No recent transactions found.');
+      return;
+    }
+
+    let foundSell = false;
 
     for (const tx of transactions) {
-      if (!tx.tokenTransfers) continue;
+      const txSignature = tx.signature;
 
-      // Filter sells where fromUserAccount matches wallet (case insensitive)
-      const sells = tx.tokenTransfers.filter(tt =>
-        tt.fromUserAccount?.toLowerCase() === WALLET_ADDRESS && tt.amount > 0
-      );
+      if (!tx.tokenTransfers || tx.tokenTransfers.length === 0) continue;
+
+      const sells = tx.tokenTransfers.filter(tt => tt.fromUserAccount === WALLET_ADDRESS && tt.amount > 0);
+
       if (sells.length === 0) continue;
+
+      foundSell = true;
 
       for (const sell of sells) {
         const tokenMint = sell.mint;
 
-        if (await hasAlreadyAlerted(tokenMint)) continue;
+        const alreadyAlerted = await hasAlreadyAlerted(tokenMint);
+        if (alreadyAlerted) continue;
 
         const creationTime = await getTokenCreationTimestamp(tokenMint);
         if (!creationTime) continue;
 
         const creationDate = new Date(creationTime * 1000);
-        const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+        const twoHoursAgo = Date.now() - (2 * 60 * 60 * 1000);
+
         if (creationDate.getTime() < twoHoursAgo) continue;
 
-        const message =
-          `🚨 Token Sell Detected!\n\n` +
-          `Token Mint: ${tokenMint}\n` +
-          `Created: ${creationDate.toLocaleString()}\n` +
-          `Transaction: https://explorer.solana.com/tx/${tx.signature}`;
+        const message = `🚨 Token Sell Detected!\n\nToken Mint: ${tokenMint}\nCreated: ${creationDate.toLocaleString()}\nTransaction: https://explorer.solana.com/tx/${txSignature}`;
 
         try {
           await bot.sendMessage(TG_CHAT_ID, message);
           await markAlerted(tokenMint);
           console.log(`✅ Alert sent for token ${tokenMint}`);
         } catch (err) {
-          console.error('❌ Telegram sendMessage error:', err.message);
+          console.error(`❌ Telegram message error for token ${tokenMint}:`, err);
         }
       }
     }
+
+    if (!foundSell) {
+      console.log('ℹ️ No sells from wallet detected in recent transactions.');
+    }
+
   } catch (error) {
-    console.error('❌ checkForNewSells error:', error.message);
+    console.error('❌ Error checking sells:', error);
   }
 }
 
 async function start() {
   await connectDB();
+
+  // Test Telegram alert on startup
+  try {
+    await bot.sendMessage(TG_CHAT_ID, '🚨 Bot started and connected successfully. Telegram alerts working!');
+    console.log('✅ Sent test Telegram alert.');
+  } catch (e) {
+    console.error('❌ Failed to send test Telegram alert:', e);
+  }
+
   await checkForNewSells();
 
-  cron.schedule('*/5 * * * *', checkForNewSells);
+  // Schedule to run every 5 minutes
+  cron.schedule('*/5 * * * *', async () => {
+    await checkForNewSells();
+  });
 
   const port = process.env.PORT || 10000;
   require('http').createServer().listen(port, () => {
@@ -109,6 +144,5 @@ async function start() {
 }
 
 start();
-
 
 

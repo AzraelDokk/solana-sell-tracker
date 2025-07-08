@@ -5,13 +5,13 @@ const fetch = require('node-fetch');
 const cron = require('node-cron');
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS.toLowerCase();
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!HELIUS_API_KEY || !WALLET_ADDRESS || !TG_TOKEN || !TG_CHAT_ID || !MONGODB_URI) {
-  console.error('❌ Missing one or more environment variables!');
+  console.error('❌ Missing environment variables');
   process.exit(1);
 }
 
@@ -30,8 +30,7 @@ async function connectDB() {
 }
 
 async function hasAlreadyAlerted(tokenMint) {
-  const record = await alertsCollection.findOne({ tokenMint });
-  return !!record;
+  return !!(await alertsCollection.findOne({ tokenMint }));
 }
 
 async function markAlerted(tokenMint) {
@@ -41,113 +40,67 @@ async function markAlerted(tokenMint) {
 async function getTokenCreationTimestamp(tokenMint) {
   try {
     const res = await fetch(tokenMetaUrl(tokenMint));
-    if (!res.ok) {
-      console.log(`⚠️ Failed to fetch token metadata for ${tokenMint}, status: ${res.status}`);
-      return null;
-    }
+    if (!res.ok) return null;
     const data = await res.json();
-    if (!data || !data.creationTime) {
-      console.log(`⚠️ No creationTime found for token ${tokenMint}`);
-      return null;
-    }
-    return data.creationTime; // Unix timestamp in seconds
-  } catch (error) {
-    console.log(`⚠️ Error fetching token metadata for ${tokenMint}:`, error);
+    return data?.creationTime || null;
+  } catch {
     return null;
   }
 }
 
 async function checkForNewSells() {
-  console.log('⏱️ Checking for new sells...');
   try {
     const res = await fetch(heliusBaseUrl);
-    if (!res.ok) {
-      console.log(`⚠️ Failed to fetch transactions, status: ${res.status}`);
-      return;
-    }
+    if (!res.ok) return;
     const transactions = await res.json();
-    if (!Array.isArray(transactions) || transactions.length === 0) {
-      console.log('ℹ️ No recent transactions found.');
-      return;
-    }
+    if (!Array.isArray(transactions) || transactions.length === 0) return;
 
     for (const tx of transactions) {
-      const txSignature = tx.signature;
-      console.log(`🔍 Checking transaction ${txSignature}`);
+      if (!tx.tokenTransfers) continue;
 
-      if (!tx.tokenTransfers || tx.tokenTransfers.length === 0) {
-        console.log(`ℹ️ No token transfers in tx ${txSignature}, skipping.`);
-        continue;
-      }
-
-      // Look for sell (swap) token transfers: From wallet to another party
-      // Filter tokenTransfers that are "swap" or "sell" — for simplicity, assume tokenTransfers where fromAddress == WALLET_ADDRESS means sell
-      const sells = tx.tokenTransfers.filter(tt => 
-        tt.fromUserAccount === WALLET_ADDRESS && tt.amount > 0
+      // Filter sells where fromUserAccount matches wallet (case insensitive)
+      const sells = tx.tokenTransfers.filter(tt =>
+        tt.fromUserAccount?.toLowerCase() === WALLET_ADDRESS && tt.amount > 0
       );
-
-      if (sells.length === 0) {
-        console.log(`ℹ️ No sells from wallet in tx ${txSignature}, skipping.`);
-        continue;
-      }
+      if (sells.length === 0) continue;
 
       for (const sell of sells) {
         const tokenMint = sell.mint;
-        console.log(`🔸 Detected sell of token ${tokenMint} in tx ${txSignature}`);
 
-        // Check if already alerted for this token
-        const alreadyAlerted = await hasAlreadyAlerted(tokenMint);
-        if (alreadyAlerted) {
-          console.log(`⚠️ Already alerted for token ${tokenMint}, skipping alert.`);
-          continue;
-        }
+        if (await hasAlreadyAlerted(tokenMint)) continue;
 
-        // Check token creation timestamp
         const creationTime = await getTokenCreationTimestamp(tokenMint);
-        if (!creationTime) {
-          console.log(`⚠️ Unable to determine creation time for token ${tokenMint}, skipping alert.`);
-          continue;
-        }
+        if (!creationTime) continue;
 
         const creationDate = new Date(creationTime * 1000);
-        console.log(`⏳ Token ${tokenMint} created at ${creationDate.toLocaleString()}`);
+        const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+        if (creationDate.getTime() < twoHoursAgo) continue;
 
-        // Check if token was created within last 2 hours
-        const twoHoursAgo = Date.now() - (2 * 60 * 60 * 1000);
-        if (creationDate.getTime() < twoHoursAgo) {
-          console.log(`⚠️ Token ${tokenMint} created more than 2 hours ago, skipping alert.`);
-          continue;
-        }
-
-        // Passed all checks — send Telegram alert
-        const message = `🚨 Token Sell Detected!\n\n` +
+        const message =
+          `🚨 Token Sell Detected!\n\n` +
           `Token Mint: ${tokenMint}\n` +
           `Created: ${creationDate.toLocaleString()}\n` +
-          `Transaction: https://explorer.solana.com/tx/${txSignature}`;
+          `Transaction: https://explorer.solana.com/tx/${tx.signature}`;
 
         try {
           await bot.sendMessage(TG_CHAT_ID, message);
-          console.log(`✅ Sent alert for token ${tokenMint}`);
           await markAlerted(tokenMint);
+          console.log(`✅ Alert sent for token ${tokenMint}`);
         } catch (err) {
-          console.error(`❌ Failed to send Telegram message for token ${tokenMint}:`, err);
+          console.error('❌ Telegram sendMessage error:', err.message);
         }
       }
     }
   } catch (error) {
-    console.error('❌ Error checking sells:', error);
+    console.error('❌ checkForNewSells error:', error.message);
   }
 }
 
 async function start() {
   await connectDB();
-  // Run check immediately on start
   await checkForNewSells();
 
-  // Then schedule every 5 minutes
-  cron.schedule('*/5 * * * *', async () => {
-    await checkForNewSells();
-  });
+  cron.schedule('*/5 * * * *', checkForNewSells);
 
   const port = process.env.PORT || 10000;
   require('http').createServer().listen(port, () => {

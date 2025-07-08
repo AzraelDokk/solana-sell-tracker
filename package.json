@@ -12,7 +12,19 @@
     "mongodb": "^6.17.0",
     "mongoose": "^8.16.2",
     "node-cron": "^4.2.0",
-    "node-fetch": "^2.6.7",
+    "node-fetch": "^2.7.0",
     "node-telegram-bot-api": "^0.66.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AzraelDokk/solana-sell-tracker.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/AzraelDokk/solana-sell-tracker/issues"
+  },
+  "homepage": "https://github.com/AzraelDokk/solana-sell-tracker#readme",
+  "description": ""
 }

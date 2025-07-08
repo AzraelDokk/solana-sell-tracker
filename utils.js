@@ -1,22 +1,35 @@
-// utils.js
+const { MongoClient } = require('mongodb');
 
-const axios = require('axios');
-require('dotenv').config();
+const MONGODB_URI = process.env.MONGODB_URI;
+let db, tokensCollection;
 
-const { TG_TOKEN, TG_CHAT_ID } = process.env;
-
-async function sendTelegramMessage(message) {
-  const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-
-  try {
-    await axios.post(url, {
-      chat_id: TG_CHAT_ID,
-      text: message,
-    });
-  } catch (err) {
-    console.error('❌ Telegram send error:', err.message);
+async function connectDB() {
+  if (!db) {
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    db = client.db('solanaSellTracker');
+    tokensCollection = db.collection('tokens');
+    console.log('✅ [utils] Connected to MongoDB');
   }
 }
 
-module.exports = { sendTelegramMessage };
+async function saveTokenCreationTime(mint, timestamp) {
+  await connectDB();
+  const exists = await tokensCollection.findOne({ mint });
+  if (!exists) {
+    await tokensCollection.insertOne({ mint, creationTime: timestamp });
+    console.log(`🧩 Saved token ${mint} created at ${new Date(timestamp * 1000).toISOString()}`);
+  }
+}
+
+async function getTokenCreationTime(mint) {
+  await connectDB();
+  const token = await tokensCollection.findOne({ mint });
+  return token ? token.creationTime : null;
+}
+
+module.exports = {
+  saveTokenCreationTime,
+  getTokenCreationTime
+};
 
